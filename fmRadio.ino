@@ -17,10 +17,12 @@ const int menuBtn = A3;
 
 const unsigned long debounceDelay = 100;
 
+const byte signal_bitmaps[4] = {0xFC, 0xF3, 0xCF, 0x3F};
+
 /* Variables */
 int recp = 0;
-byte strength[51];
-byte signalLev = 0;
+byte strength[26];
+byte currentStddev = 0;
 
 // Current FCC channel / frequency
 int channel = 200;
@@ -44,19 +46,37 @@ unsigned long indexDownTime = 0;
 unsigned long menuTime = 0;
 
 // Convert FCC channel ID to frequency in MHz
-float calculateFrequencyFromChannel(int chn)
-{
+float calculateFrequencyFromChannel(int chn) {
   return 87.9 + ((chn - 200) * 0.2);
 }
 
 // Get the original signal level from the last time this channel was visited
-byte getStoredSignalLevel(int chn)
-{
-  return ((chn % 2) == 1) ? ((strength[(chn - 200) / 2] & 0xF0) >> 4) : (strength[(chn - 200) / 2] & 0x0F);
+byte getStoredSignalLevel(int chn) {
+  int chn_reduc = chn - 200;
+  return (strength[chn_reduc / 4] >> (2 * (chn_reduc % 4))) & 3;
 }
 
-void setup()
-{
+// Get the distance from the sample mean for a given sample level
+byte signal_to_stddev(byte signal_lev) {
+  // Results of sample standard deviation for 16 active FM channel signals
+  // Sample mean: 8.25
+  // Sample standard deviation: 3.40
+  if (signal_lev >= 12) {
+    // +2 standard deviations: [12, 15]
+    return 3;
+  } else if (signal_lev >= 8) {
+    // +1 standard deviation: [8, 12)
+    return 2;
+  } else if (signal_lev >= 5) {
+    // -1 standard deviation: [5, 8)
+    return 1;
+  } else {
+    // -2 standard deviations: [0, 5)
+    return 0;
+  }
+}
+
+void setup() {
   // Initialize screen
   screen.begin(16, 2);
 
@@ -69,9 +89,9 @@ void setup()
 
   // Test channels for signal level
   radio.toggleMute();
-  byte sig = 0;
-  for (int i = 0; i <= 100; i++)
-  {
+  byte sig = 0, stddev = 0, old = 0;
+
+  for (int i = 0; i <= 100; i++) {
     screen.print("Testing CH");
     screen.print(i + 200);
     screen.setCursor(0, 1);
@@ -80,7 +100,9 @@ void setup()
     screen.print(101);
     radio.selectChannel(i + 200, false);
     sig = radio.getSignalLevel();
-    strength[i / 2] |= ((i % 2) == 1) ? (sig << 4) : sig;
+    stddev = signal_to_stddev(sig);
+    old = strength[i / 4] & signal_bitmaps[i % 4];
+    strength[i / 4] = old | (stddev << (2 * (i % 4)));
     screen.clear();
   }
 
@@ -95,8 +117,7 @@ void setup()
   printStationData();
 }
 
-void loop()
-{
+void loop() {
   // Get current button press states
   muteBtnState = analogRead(muteBtn);
   indexUpBtnState = analogRead(indexUpBtn);
@@ -107,10 +128,8 @@ void loop()
   unsigned long readTime = millis();
 
   // Mute button press: toggle mute
-  if (muteBtnState == 1023)
-  {
-    if ((readTime - muteTime) >= debounceDelay)
-    {
+  if (muteBtnState == 1023) {
+    if ((readTime - muteTime) >= debounceDelay) {
       radio.toggleMute();
       globalMute = radio.isMuted();
 
@@ -121,10 +140,8 @@ void loop()
   }
 
   // Menu button press: toggle seek mode
-  if (menuBtnState == 1023)
-  {
-    if ((readTime - menuTime) >= debounceDelay)
-    {
+  if (menuBtnState == 1023) {
+    if ((readTime - menuTime) >= debounceDelay) {
       seekMode = !seekMode;
       delay(debounceDelay);
     }
@@ -133,27 +150,23 @@ void loop()
   }
 
   // Index Up button press
-  if (indexUpBtnState == 1023)
-  {
-    if ((readTime - indexUpTime) >= debounceDelay)
-    {
-      if (!globalMute)
-      {
+  if (indexUpBtnState == 1023) {
+    if ((readTime - indexUpTime) >= debounceDelay) {
+      if (!globalMute) {
         radio.toggleMute();
       }
 
       // Go to next channel
       channel = (channel == 300) ? 200 : (channel + 1);
-      if (seekMode)
-      {
+
+      if (seekMode) {
         seekChannel(SEEK_UP);
       }
 
       radio.selectChannel(channel, false);
       changed = true;
 
-      if (!globalMute)
-      {
+      if (!globalMute) {
         radio.toggleMute();
       }
 
@@ -164,27 +177,23 @@ void loop()
   }
 
   // Index Down button press
-  if (indexDownBtnState == 1023)
-  {
-    if ((readTime - indexDownTime) >= debounceDelay)
-    {
-      if (!globalMute)
-      {
+  if (indexDownBtnState == 1023) {
+    if ((readTime - indexDownTime) >= debounceDelay) {
+      if (!globalMute) {
         radio.toggleMute();
       }
 
       // Go to previous channel
       channel = (channel == 200) ? 300 : (channel - 1);
-      if (seekMode)
-      {
+
+      if (seekMode) {
         seekChannel(SEEK_DOWN);
       }
 
       radio.selectChannel(channel, false);
       changed = true;
 
-      if (!globalMute)
-      {
+      if (!globalMute) {
         radio.toggleMute();
       }
 
@@ -195,8 +204,7 @@ void loop()
   }
 
   // Update data if station has been changed
-  if (changed)
-  {
+  if (changed) {
     setStationData();
     changed = false;
   }
@@ -205,8 +213,7 @@ void loop()
   screen.clear();
   printStationData();
 
-  if (globalMute)
-  {
+  if (globalMute) {
     printMuted();
   }
 
@@ -214,64 +221,63 @@ void loop()
 }
 
 // Use the signal level array to find a new channel
-void seekChannel(int direction)
-{
+void seekChannel(int direction) {
   bool found = false;
+  
+  // Save the starting channel to prevent an infinite loop
+  int start = channel;
 
   screen.clear();
   screen.print("Seeking...");
 
-  while (!found)
-  {
-    if (getStoredSignalLevel(channel) >= 7)
-    {
+  while (!found) {
+    if (getStoredSignalLevel(channel) & 2) {
+      // Stored station signal level is above the sample mean
       found = true;
-    }
-    else
-    {
-      if (direction)
-      {
+    } else {
+      // Stored station signal level is below the sample mean
+      if (direction) {
         // SEEK_UP
         channel = (channel == 300) ? 200 : (channel + 1);
-      }
-      else
-      {
+      } else {
         // SEEK_DOWN
         channel = (channel == 200) ? 300 : (channel - 1);
+      }
+      if (start == channel) {
+        // If there are no other available stations on the spectrum,
+        // use the channel set at the beginning of the seek operation
+        found = true;
       }
     }
   }
 }
 
-void setStationData()
-{
+void setStationData() {
   frequency = calculateFrequencyFromChannel(channel);
   recp = radio.isStereo();
-  signalLev = radio.getSignalLevel();
+  currentStddev = signal_to_stddev(radio.getSignalLevel());
 
   // Update signal level
-  byte oldSig = strength[(channel - 200) / 2];
-  strength[(channel - 200) / 2] = ((channel % 2) == 1) ? ((oldSig & 0x0F) | (signalLev << 4)) : ((oldSig & 0xF0) | signalLev);
+  int chn_reduc = channel - 200;
+  byte oldSig = strength[chn_reduc / 4] & signal_bitmaps[chn_reduc % 4];
+  strength[chn_reduc / 4] = oldSig | (currentStddev << (2 * (chn_reduc % 4)));
 }
 
-void printStationData()
-{
-  if (frequency < 100)
-  {
+void printStationData() {
+  if (frequency < 100) {
     screen.print(" ");
   }
 
   screen.print(frequency, 1);
-  screen.print(recp ? "-ST" : "-MN");
+  screen.print(recp ? "-ST:" : "-MN:");
+  screen.print(currentStddev);
 
-  if (seekMode)
-  {
+  if (seekMode) {
     screen.print(" SK");
   }
 }
 
-void printMuted()
-{
+void printMuted() {
   screen.setCursor(0, 1);
   screen.print("Muted...");
 }
